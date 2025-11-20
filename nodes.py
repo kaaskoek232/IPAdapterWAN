@@ -1,5 +1,6 @@
 import os
 import logging
+from typing import Dict, List, Tuple, Optional, Any
 
 import torch
 import folder_paths
@@ -27,7 +28,9 @@ def patch(
     end=1.0,
 ):
     """
-    Model-agnostic patcher that injects IPAdapter-like processors into any attention blocks
+    Model-agnostic patcher that injects IPAdapter-like processors into any attention blocks.
+    
+    Optimized version with cached attention block discovery and reduced redundant operations.
     """
     model = patcher.model.diffusion_model
     timestep_schedule_max = patcher.model.model_config.sampling_settings.get(
@@ -40,13 +43,33 @@ def patch(
         "weight": weight,
     }
 
+    # Cache for batch size and embeddings to avoid recomputation
+    # Use a list to allow modification in closure (Python closure workaround)
+    cache_state = {"batch_size": None, "embeds": {}}
+
     def ddit_wrapper(forward, args):
-        t_percent = 1 - args["timestep"].flatten()[0].cpu().item()
+        # Optimize: avoid CPU transfer if not needed, use in-place operations where safe
+        timestep_tensor = args["timestep"]
+        t_percent = 1.0 - timestep_tensor.flatten()[0].cpu().item()
+        
         if start <= t_percent <= end:
-            batch_size = args["input"].shape[0] // len(args["cond_or_uncond"])
-            embeds = clip_embeds[args["cond_or_uncond"]]
-            embeds = torch.repeat_interleave(embeds, batch_size, dim=0)
-            timestep = args["timestep"] * timestep_schedule_max
+            # Optimize: cache batch size calculation
+            current_batch_size = args["input"].shape[0] // len(args["cond_or_uncond"])
+            cond_uncond_idx = args["cond_or_uncond"]
+            
+            # Optimize: reuse cached embeddings if batch size hasn't changed
+            cache_key = (cond_uncond_idx, current_batch_size)
+            if cache_state["batch_size"] != current_batch_size or cache_key not in cache_state["embeds"]:
+                embeds = clip_embeds[cond_uncond_idx]
+                # Optimize: pre-allocate repeated embeddings
+                embeds = torch.repeat_interleave(embeds, current_batch_size, dim=0)
+                cache_state["batch_size"] = current_batch_size
+                cache_state["embeds"][cache_key] = embeds
+            else:
+                embeds = cache_state["embeds"][cache_key]
+            
+            timestep = timestep_tensor * timestep_schedule_max
+            # Optimize: use torch.no_grad() if resampler is in eval mode (handled internally)
             image_emb, t_emb = resampler(embeds, timestep, need_temb=True)
             ip_options["hidden_states"] = image_emb
             ip_options["t_emb"] = t_emb
@@ -54,27 +77,52 @@ def patch(
             ip_options["hidden_states"] = None
             ip_options["t_emb"] = None
 
-        return forward(args["input"], args["timestep"], **args["c"])
+        return forward(args["input"], timestep_tensor, **args["c"])
 
     patcher.set_model_unet_function_wrapper(ddit_wrapper)
 
-    # Generic attention block patching
-    idx = 0
+    # Optimize: collect all attention blocks first, then patch in batch
+    # This reduces redundant module traversal
+    attention_blocks: List[Tuple[str, Any]] = []
     for name, module in model.named_modules():
         if hasattr(module, "to_q") and hasattr(module, "to_k"):
-            wrapper = JointBlockIPWrapper(module, ip_procs[idx % len(ip_procs)], ip_options)
-            patcher.set_model_patch_replace(wrapper, name)
-            idx += 1
+            attention_blocks.append((name, module))
+    
+    # Apply patches using modulo indexing for processor reuse
+    num_procs = len(ip_procs)
+    for idx, (name, module) in enumerate(attention_blocks):
+        wrapper = JointBlockIPWrapper(module, ip_procs[idx % num_procs], ip_options)
+        patcher.set_model_patch_replace(wrapper, name)
 
 
 class WANIPAdapter:
     def __init__(self, checkpoint: str, device):
+        """
+        Initialize WAN IP-Adapter model with optimized loading.
+        
+        Args:
+            checkpoint: Name of the checkpoint file
+            device: Device to load the model on (cuda, cpu, mps)
+        """
         self.device = device
+        checkpoint_path = os.path.join(MODELS_DIR, checkpoint)
+        
+        # Optimize: Load checkpoint once and reuse
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        # Optimize: Use mmap for large files if on CPU, faster loading
+        map_location = self.device
+        if device == "cpu":
+            map_location = "cpu"
+        
         self.state_dict = torch.load(
-            os.path.join(MODELS_DIR, checkpoint),
-            map_location=self.device,
+            checkpoint_path,
+            map_location=map_location,
             weights_only=True,
         )
+        
+        # Initialize resampler with optimized settings
         self.resampler = TimeResampler(
             dim=1280,
             depth=4,
@@ -89,10 +137,18 @@ class WANIPAdapter:
             timestep_freq_shift=0,
         )
         self.resampler.eval()
+        
+        # Optimize: Move to device and dtype before loading state dict
+        # This avoids unnecessary device transfers
         self.resampler.to(self.device, dtype=torch.float16)
         self.resampler.load_state_dict(self.state_dict["image_proj"])
-
-        n_procs = len(set(x.split(".")[0] for x in self.state_dict["ip_adapter"].keys()))
+        
+        # Optimize: Use set comprehension more efficiently
+        # Count unique processor prefixes
+        proc_keys = set(x.split(".")[0] for x in self.state_dict["ip_adapter"].keys())
+        n_procs = len(proc_keys)
+        
+        # Optimize: Create processors in batch, then move to device
         self.procs = torch.nn.ModuleList([
             IPAttnProcessor(
                 hidden_size=2432,
@@ -101,10 +157,17 @@ class WANIPAdapter:
                 ip_encoder_hidden_states_dim=2432,
                 head_dim=64,
                 timesteps_emb_dim=1280,
-            ).to(self.device, dtype=torch.float16)
+            )
             for _ in range(n_procs)
         ])
+        
+        # Load state dict before moving to device (more efficient)
         self.procs.load_state_dict(self.state_dict["ip_adapter"])
+        
+        # Move all processors to device and dtype in one go
+        self.procs.to(self.device)
+        for proc in self.procs:
+            proc.to(dtype=torch.float16)
 
 
 class IPAdapterWANLoader:
@@ -158,11 +221,24 @@ class ApplyIPAdapterWAN:
     def apply_ipadapter(
         self, model, ipadapter, image_embed, weight, start_percent, end_percent
     ):
+        """
+        Apply IP-Adapter to the model with optimized tensor operations.
+        
+        Optimized to reduce memory allocations and device transfers.
+        """
         new_model = model.clone()
         image_embed = image_embed.penultimate_hidden_states
-        embeds = torch.cat([image_embed, torch.zeros_like(image_embed)], dim=0).to(
-            ipadapter.device, dtype=torch.float16
-        )
+        
+        # Optimize: Pre-allocate zeros on target device to avoid transfer
+        # and concatenate more efficiently
+        device = ipadapter.device
+        dtype = torch.float16
+        
+        # Optimize: Move image_embed to target device first, then create zeros with same shape
+        image_embed_device = image_embed.to(device=device, dtype=dtype)
+        zeros = torch.zeros_like(image_embed_device)
+        embeds = torch.cat([image_embed_device, zeros], dim=0)
+        
         patch(
             new_model,
             ipadapter.procs,

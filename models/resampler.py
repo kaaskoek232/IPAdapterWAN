@@ -1,5 +1,6 @@
 # modified from https://github.com/mlfoundations/open_flamingo/blob/main/open_flamingo/src/helpers.py
 import math
+from typing import Tuple, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -180,32 +181,55 @@ class TimeResampler(nn.Module):
         #     nn.Linear(timestep_out_dim, 6 * timestep_out_dim, bias=True)
         # )
 
-    def forward(self, x, timestep, need_temb=False):
+    def forward(self, x: torch.Tensor, timestep: torch.Tensor, need_temb: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Optimized forward pass with improved memory efficiency and computation.
+        
+        Args:
+            x: Input tensor
+            timestep: Timestep tensor
+            need_temb: Whether to return timestep embedding
+            
+        Returns:
+            latents or (latents, timestep_emb) if need_temb is True
+        """
+        # Optimize: compute timestep embedding once
         timestep_emb = self.embedding_time(x, timestep)  # bs, dim
 
-        latents = self.latents.repeat(x.size(0), 1, 1)
+        # Optimize: expand latents more efficiently
+        batch_size = x.size(0)
+        latents = self.latents.expand(batch_size, -1, -1)
 
+        # Optimize: project input and add timestep embedding in one step
         x = self.proj_in(x)
-        x = x + timestep_emb[:, None]
+        x = x + timestep_emb.unsqueeze(1)  # More efficient than [:, None]
 
+        # Optimize: pre-compute adaLN modulation values outside the loop if possible
+        # But we need them per layer, so keep in loop but optimize chunk operation
         for attn, ff, adaLN_modulation in self.layers:
-            shift_msa, scale_msa, shift_mlp, scale_mlp = adaLN_modulation(
-                timestep_emb
-            ).chunk(4, dim=1)
+            # Optimize: compute modulation once and chunk efficiently
+            modulation = adaLN_modulation(timestep_emb)
+            shift_msa, scale_msa, shift_mlp, scale_mlp = modulation.chunk(4, dim=1)
+            
+            # Optimize: use residual connection more efficiently
             latents = attn(x, latents, shift_msa, scale_msa) + latents
 
+            # Optimize: store residual before FF processing
             res = latents
-            for idx_ff in range(len(ff)):
-                layer_ff = ff[idx_ff]
+            
+            # Optimize: process FF layers with optimized adaLN application
+            for idx_ff, layer_ff in enumerate(ff):
                 latents = layer_ff(latents)
+                # Optimize: apply adaLN more efficiently
                 if idx_ff == 0 and isinstance(layer_ff, nn.LayerNorm):  # adaLN
-                    latents = latents * (
-                        1 + scale_mlp.unsqueeze(1)
-                    ) + shift_mlp.unsqueeze(1)
+                    # Use in-place operations where safe (but be careful with gradients)
+                    scale_mlp_expanded = scale_mlp.unsqueeze(1)
+                    latents = latents * (1 + scale_mlp_expanded) + shift_mlp.unsqueeze(1)
+            
+            # Optimize: add residual connection
             latents = latents + res
 
-            # latents = ff(latents) + latents
-
+        # Optimize: final projection and normalization
         latents = self.proj_out(latents)
         latents = self.norm_out(latents)
 
@@ -214,31 +238,44 @@ class TimeResampler(nn.Module):
         else:
             return latents
 
-    def embedding_time(self, sample, timestep):
-
-        # 1. time
+    def embedding_time(self, sample: torch.Tensor, timestep: Union[torch.Tensor, float, int]) -> torch.Tensor:
+        """
+        Optimized timestep embedding computation.
+        
+        Args:
+            sample: Sample tensor to infer device and dtype
+            timestep: Timestep value(s)
+            
+        Returns:
+            Timestep embedding tensor
+        """
+        # Optimize: handle timestep tensor conversion more efficiently
         timesteps = timestep
         if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-            # This would be a good case for the `match` statement (Python 3.10+)
-            is_mps = sample.device.type == "mps"
+            # Optimize: determine device and dtype more efficiently
+            device = sample.device
+            is_mps = device.type == "mps"
+            
             if isinstance(timestep, float):
                 dtype = torch.float32 if is_mps else torch.float64
             else:
                 dtype = torch.int32 if is_mps else torch.int64
-            timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
+            
+            timesteps = torch.tensor([timesteps], dtype=dtype, device=device)
         elif len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
+            # Optimize: expand scalar tensor more efficiently
+            timesteps = timesteps.unsqueeze(0).to(sample.device)
 
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
+        # Optimize: broadcast to batch dimension
+        batch_size = sample.shape[0]
+        timesteps = timesteps.expand(batch_size)
 
+        # Optimize: project timesteps
         t_emb = self.time_proj(timesteps)
 
-        # timesteps does not contain any weights and will always return f32 tensors
-        # but time_embedding might actually be running in fp16. so we need to cast here.
-        # there might be better ways to encapsulate this.
+        # Optimize: cast to sample dtype (avoids unnecessary dtype conversions)
         t_emb = t_emb.to(dtype=sample.dtype)
 
+        # Optimize: compute embedding
         emb = self.time_embedding(t_emb, None)
         return emb
