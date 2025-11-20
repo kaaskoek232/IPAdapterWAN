@@ -1,3 +1,4 @@
 torch
 einops
 diffusers
+safetensors>=0.3.0; extra == "safetensors"

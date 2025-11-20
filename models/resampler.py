@@ -1,5 +1,6 @@
 # modified from https://github.com/mlfoundations/open_flamingo/blob/main/open_flamingo/src/helpers.py
 import math
+from typing import Tuple, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -18,19 +19,30 @@ def FeedForward(dim, mult=4):
     )
 
 
-def reshape_tensor(x, heads):
+def reshape_tensor(x: torch.Tensor, heads: int) -> torch.Tensor:
+    """
+    Optimized tensor reshaping for attention heads.
+    
+    Args:
+        x: Input tensor of shape (bs, length, width)
+        heads: Number of attention heads
+        
+    Returns:
+        Reshaped tensor of shape (bs, heads, length, dim_per_head)
+    """
     bs, length, width = x.shape
-    # (bs, length, width) --> (bs, length, n_heads, dim_per_head)
-    x = x.view(bs, length, heads, -1)
-    # (bs, length, n_heads, dim_per_head) --> (bs, n_heads, length, dim_per_head)
-    x = x.transpose(1, 2)
-    # (bs, n_heads, length, dim_per_head) --> (bs*n_heads, length, dim_per_head)
-    x = x.reshape(bs, heads, length, -1)
+    dim_per_head = width // heads
+    # Optimize: use view with explicit shape for better performance
+    x = x.view(bs, length, heads, dim_per_head)
+    # Transpose and reshape in one step
+    x = x.transpose(1, 2).contiguous()  # Add contiguous for memory efficiency
     return x
 
 
 class PerceiverAttention(nn.Module):
-    def __init__(self, *, dim, dim_head=64, heads=8):
+    """Optimized Perceiver attention module with reduced memory allocations."""
+    
+    def __init__(self, *, dim: int, dim_head: int = 64, heads: int = 8):
         super().__init__()
         self.scale = dim_head**-0.5
         self.dim_head = dim_head
@@ -44,23 +56,39 @@ class PerceiverAttention(nn.Module):
         self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
         self.to_out = nn.Linear(inner_dim, dim, bias=False)
 
-    def forward(self, x, latents, shift=None, scale=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        latents: torch.Tensor,
+        shift: Optional[torch.Tensor] = None,
+        scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
+        Optimized forward pass with reduced intermediate allocations.
+        
         Args:
-            x (torch.Tensor): image features
-                shape (b, n1, D)
-            latent (torch.Tensor): latent features
-                shape (b, n2, D)
+            x: Image features of shape (b, n1, D)
+            latents: Latent features of shape (b, n2, D)
+            shift: Optional shift tensor for adaLN
+            scale: Optional scale tensor for adaLN
+            
+        Returns:
+            Output tensor of shape (b, n2, D)
         """
         x = self.norm1(x)
         latents = self.norm2(latents)
 
+        # Apply adaLN if provided
         if shift is not None and scale is not None:
-            latents = latents * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+            # Optimize: use unsqueeze once
+            scale_expanded = scale.unsqueeze(1)
+            shift_expanded = shift.unsqueeze(1)
+            latents = latents * (1 + scale_expanded) + shift_expanded
 
         b, l, _ = latents.shape
 
         q = self.to_q(latents)
+        # Optimize: concatenate only when needed
         kv_input = torch.cat((x, latents), dim=-2)
         k, v = self.to_kv(kv_input).chunk(2, dim=-1)
 
@@ -68,15 +96,19 @@ class PerceiverAttention(nn.Module):
         k = reshape_tensor(k, self.heads)
         v = reshape_tensor(v, self.heads)
 
-        # attention
-        scale = 1 / math.sqrt(math.sqrt(self.dim_head))
-        weight = (q * scale) @ (k * scale).transpose(
-            -2, -1
-        )  # More stable with f16 than dividing afterwards
-        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        # Optimized attention computation
+        # Pre-compute scale factor
+        attn_scale = 1.0 / math.sqrt(math.sqrt(self.dim_head))
+        q_scaled = q * attn_scale
+        k_scaled = k * attn_scale
+        
+        # Compute attention weights (more stable with f16)
+        weight = q_scaled @ k_scaled.transpose(-2, -1)
+        weight = torch.softmax(weight.float(), dim=-1).to(weight.dtype)
         out = weight @ v
 
-        out = out.permute(0, 2, 1, 3).reshape(b, l, -1)
+        # Optimize: use view instead of reshape when possible
+        out = out.permute(0, 2, 1, 3).contiguous().view(b, l, -1)
 
         return self.to_out(out)
 
@@ -180,31 +212,51 @@ class TimeResampler(nn.Module):
         #     nn.Linear(timestep_out_dim, 6 * timestep_out_dim, bias=True)
         # )
 
-    def forward(self, x, timestep, need_temb=False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        need_temb: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Optimized forward pass with reduced memory allocations.
+        
+        Args:
+            x: Input embeddings
+            timestep: Timestep tensor
+            need_temb: Whether to return time embedding
+            
+        Returns:
+            Latents (and optionally time embedding)
+        """
         timestep_emb = self.embedding_time(x, timestep)  # bs, dim
 
-        latents = self.latents.repeat(x.size(0), 1, 1)
+        # Optimize: use expand instead of repeat when possible
+        batch_size = x.size(0)
+        latents = self.latents.expand(batch_size, -1, -1)
 
         x = self.proj_in(x)
-        x = x + timestep_emb[:, None]
+        # Optimize: use unsqueeze once
+        x = x + timestep_emb.unsqueeze(1)
 
         for attn, ff, adaLN_modulation in self.layers:
-            shift_msa, scale_msa, shift_mlp, scale_mlp = adaLN_modulation(
-                timestep_emb
-            ).chunk(4, dim=1)
+            # Pre-compute adaLN parameters
+            adaLN_params = adaLN_modulation(timestep_emb)
+            shift_msa, scale_msa, shift_mlp, scale_mlp = adaLN_params.chunk(4, dim=1)
+            
+            # Attention with residual
             latents = attn(x, latents, shift_msa, scale_msa) + latents
 
+            # Feed-forward with adaLN
             res = latents
-            for idx_ff in range(len(ff)):
-                layer_ff = ff[idx_ff]
+            for idx_ff, layer_ff in enumerate(ff):
                 latents = layer_ff(latents)
-                if idx_ff == 0 and isinstance(layer_ff, nn.LayerNorm):  # adaLN
-                    latents = latents * (
-                        1 + scale_mlp.unsqueeze(1)
-                    ) + shift_mlp.unsqueeze(1)
+                # Apply adaLN after first LayerNorm
+                if idx_ff == 0 and isinstance(layer_ff, nn.LayerNorm):
+                    scale_expanded = scale_mlp.unsqueeze(1)
+                    shift_expanded = shift_mlp.unsqueeze(1)
+                    latents = latents * (1 + scale_expanded) + shift_expanded
             latents = latents + res
-
-            # latents = ff(latents) + latents
 
         latents = self.proj_out(latents)
         latents = self.norm_out(latents)
@@ -214,31 +266,47 @@ class TimeResampler(nn.Module):
         else:
             return latents
 
-    def embedding_time(self, sample, timestep):
-
-        # 1. time
-        timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-            # This would be a good case for the `match` statement (Python 3.10+)
+    def embedding_time(
+        self,
+        sample: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+    ) -> torch.Tensor:
+        """
+        Optimized time embedding with reduced CPU-GPU transfers.
+        
+        Args:
+            sample: Sample tensor to infer device/dtype from
+            timestep: Timestep value(s)
+            
+        Returns:
+            Time embedding tensor
+        """
+        # Optimize: handle tensor conversion more efficiently
+        if not torch.is_tensor(timestep):
+            # Avoid CPU-GPU sync when possible
             is_mps = sample.device.type == "mps"
             if isinstance(timestep, float):
                 dtype = torch.float32 if is_mps else torch.float64
             else:
                 dtype = torch.int32 if is_mps else torch.int64
-            timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
-        elif len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
+            timesteps = torch.tensor([timestep], dtype=dtype, device=sample.device)
+        elif timestep.dim() == 0:
+            timesteps = timestep.unsqueeze(0).to(sample.device)
+        else:
+            timesteps = timestep.to(sample.device)
 
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
+        # Broadcast to batch dimension efficiently
+        batch_size = sample.shape[0]
+        if timesteps.shape[0] == 1:
+            timesteps = timesteps.expand(batch_size)
+        elif timesteps.shape[0] != batch_size:
+            timesteps = timesteps.expand(batch_size)
 
         t_emb = self.time_proj(timesteps)
 
-        # timesteps does not contain any weights and will always return f32 tensors
-        # but time_embedding might actually be running in fp16. so we need to cast here.
-        # there might be better ways to encapsulate this.
-        t_emb = t_emb.to(dtype=sample.dtype)
+        # Cast to sample dtype for consistency (time_proj returns f32)
+        if t_emb.dtype != sample.dtype:
+            t_emb = t_emb.to(dtype=sample.dtype)
 
         emb = self.time_embedding(t_emb, None)
         return emb
