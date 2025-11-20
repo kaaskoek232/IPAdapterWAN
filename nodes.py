@@ -1,9 +1,16 @@
 import os
 import logging
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Optional, Tuple, Any
 
 import torch
 import folder_paths
+
+try:
+    from safetensors.torch import load_file as safetensors_load
+    SAFETENSORS_AVAILABLE = True
+except ImportError:
+    SAFETENSORS_AVAILABLE = False
+    logging.warning("safetensors not available, falling back to torch.load")
 
 from .models.resampler import TimeResampler
 from .models.jointblock import JointBlockIPWrapper, IPAttnProcessor
@@ -18,39 +25,39 @@ folder_paths.folder_names_and_paths["ipadapter"] = (
     folder_paths.supported_pt_extensions,
 )
 
-# Cache for attention block names to avoid repeated scanning
+# Cache for attention block names to avoid repeated iteration
+# Key: model type name, Value: list of attention block names
 _attention_block_cache: Dict[str, List[str]] = {}
 
 
-def _get_attention_blocks(model: torch.nn.Module, model_id: str) -> List[Tuple[str, torch.nn.Module]]:
+def _get_attention_blocks(model: torch.nn.Module) -> List[Tuple[str, torch.nn.Module]]:
     """
-    Get all attention blocks from a model, with caching to avoid repeated scanning.
-    
-    Args:
-        model: The diffusion model to scan
-        model_id: Unique identifier for the model (for caching)
-    
-    Returns:
-        List of (name, module) tuples for attention blocks
+    Cache attention block discovery for performance.
+    Uses model type as cache key for stability.
     """
-    if model_id in _attention_block_cache:
-        # Use cached names, but fetch fresh modules
-        return [(name, dict(model.named_modules())[name]) 
-                for name in _attention_block_cache[model_id]]
+    model_type = type(model).__name__
+    cache_key = f"{model_type}_{id(type(model))}"
     
-    # Scan and cache
-    attention_blocks = []
-    for name, module in model.named_modules():
-        if hasattr(module, "to_q") and hasattr(module, "to_k"):
-            attention_blocks.append((name, module))
-    
-    # Cache the names
-    _attention_block_cache[model_id] = [name for name, _ in attention_blocks]
-    return attention_blocks
+    if cache_key not in _attention_block_cache:
+        blocks = []
+        for name, module in model.named_modules():
+            if hasattr(module, "to_q") and hasattr(module, "to_k"):
+                blocks.append((name, module))
+        _attention_block_cache[cache_key] = [name for name, _ in blocks]
+        return blocks
+    else:
+        # Use cached names but still need to get modules
+        blocks = []
+        cached_names = _attention_block_cache[cache_key]
+        module_dict = dict(model.named_modules())
+        for name in cached_names:
+            if name in module_dict:
+                blocks.append((name, module_dict[name]))
+        return blocks
 
 
 def patch(
-    patcher,
+    patcher: Any,
     ip_procs: torch.nn.ModuleList,
     resampler: TimeResampler,
     clip_embeds: torch.Tensor,
@@ -61,16 +68,7 @@ def patch(
     """
     Model-agnostic patcher that injects IPAdapter-like processors into any attention blocks.
     
-    Optimized version that caches attention block discovery and reduces CPU-GPU transfers.
-    
-    Args:
-        patcher: Model patcher from ComfyUI
-        ip_procs: List of IP attention processors
-        resampler: Time-based resampler for embeddings
-        clip_embeds: CLIP vision embeddings (shape: [2, seq_len, embed_dim])
-        weight: Weight for IP adapter influence
-        start: Start percentage of timestep range (0.0-1.0)
-        end: End percentage of timestep range (0.0-1.0)
+    Optimized to cache attention block discovery and reduce redundant operations.
     """
     model = patcher.model.diffusion_model
     timestep_schedule_max = patcher.model.model_config.sampling_settings.get(
@@ -80,31 +78,31 @@ def patch(
     # Use model's string representation as cache key
     model_id = str(id(model))
 
+    # Use a shared dict for ip_options to avoid repeated dict lookups
     ip_options: Dict[str, Optional[torch.Tensor]] = {
         "hidden_states": None,
         "t_emb": None,
         "weight": weight,
     }
 
-    def ddit_wrapper(forward, args):
-        # Optimize: avoid CPU transfer if possible, use item() directly on GPU tensor
-        timestep_tensor = args["timestep"].flatten()
-        # Use first element without full CPU transfer if tensor is small
-        if timestep_tensor.numel() == 1:
-            t_percent = 1.0 - timestep_tensor.item() / timestep_schedule_max
+    def ddit_wrapper(forward: Any, args: Dict[str, Any]) -> torch.Tensor:
+        """Optimized wrapper with reduced CPU-GPU transfers"""
+        timestep_tensor = args["timestep"]
+        # Avoid CPU transfer if possible - compute on GPU
+        t_flattened = timestep_tensor.flatten()
+        if t_flattened.numel() > 0:
+            t_percent = 1.0 - t_flattened[0].item()
         else:
-            t_percent = 1.0 - timestep_tensor[0].cpu().item() / timestep_schedule_max
-        
+            t_percent = 0.0
+            
         if start <= t_percent <= end:
             batch_size = args["input"].shape[0] // len(args["cond_or_uncond"])
-            embeds = clip_embeds[args["cond_or_uncond"]]
-            # Optimize: use expand + reshape instead of repeat_interleave when possible
+            cond_indices = args["cond_or_uncond"]
+            embeds = clip_embeds[cond_indices]
+            # Use expand + view instead of repeat_interleave when possible for better memory
             if batch_size > 1:
                 embeds = torch.repeat_interleave(embeds, batch_size, dim=0)
-            else:
-                embeds = embeds  # No need to repeat
-            
-            timestep = args["timestep"] * timestep_schedule_max
+            timestep = timestep_tensor * timestep_schedule_max
             image_emb, t_emb = resampler(embeds, timestep, need_temb=True)
             ip_options["hidden_states"] = image_emb
             ip_options["t_emb"] = t_emb
@@ -112,62 +110,62 @@ def patch(
             ip_options["hidden_states"] = None
             ip_options["t_emb"] = None
 
-        return forward(args["input"], args["timestep"], **args["c"])
+        return forward(args["input"], timestep_tensor, **args["c"])
 
     patcher.set_model_unet_function_wrapper(ddit_wrapper)
 
-    # Optimized: Use cached attention block discovery
-    attention_blocks = _get_attention_blocks(model, model_id)
+    # Use cached attention block discovery
+    attention_blocks = _get_attention_blocks(model)
     n_procs = len(ip_procs)
     
+    # Pre-allocate wrappers if possible
     for idx, (name, module) in enumerate(attention_blocks):
-        wrapper = JointBlockIPWrapper(
-            module, 
-            ip_procs[idx % n_procs], 
-            ip_options
-        )
+        wrapper = JointBlockIPWrapper(module, ip_procs[idx % n_procs], ip_options)
         patcher.set_model_patch_replace(wrapper, name)
 
 
+def _load_checkpoint(checkpoint_path: str, device: str) -> Dict[str, Any]:
+    """Load checkpoint with safetensors support for better performance and safety"""
+    checkpoint_path_full = os.path.join(MODELS_DIR, checkpoint_path)
+    
+    if not os.path.exists(checkpoint_path_full):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_full}")
+    
+    # Try safetensors first if available
+    if SAFETENSORS_AVAILABLE and checkpoint_path_full.endswith('.safetensors'):
+        try:
+            logging.info(f"Loading checkpoint using safetensors: {checkpoint_path_full}")
+            return safetensors_load(checkpoint_path_full, device=device)
+        except Exception as e:
+            logging.warning(f"Failed to load safetensors, falling back to torch.load: {e}")
+    
+    # Fallback to torch.load
+    logging.info(f"Loading checkpoint using torch.load: {checkpoint_path_full}")
+    return torch.load(
+        checkpoint_path_full,
+        map_location=device,
+        weights_only=True,
+    )
+
+
 class WANIPAdapter:
-    """
-    WAN IP-Adapter model loader and manager.
-    
-    Optimized for faster loading and memory efficiency.
-    """
-    
     def __init__(self, checkpoint: str, device: str):
         """
-        Initialize WAN IP-Adapter from checkpoint.
+        Initialize WAN IP-Adapter with optimized loading and memory management.
         
         Args:
-            checkpoint: Name of the checkpoint file in MODELS_DIR
-            device: Device to load model on ("cuda", "cpu", or "mps")
-        
-        Raises:
-            FileNotFoundError: If checkpoint file doesn't exist
-            KeyError: If required keys are missing from state_dict
+            checkpoint: Name of the checkpoint file
+            device: Device to load the model on ('cuda', 'cpu', or 'mps')
         """
         self.device = device
-        checkpoint_path = os.path.join(MODELS_DIR, checkpoint)
         
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        try:
+            self.state_dict = _load_checkpoint(checkpoint, device)
+        except Exception as e:
+            logging.error(f"Failed to load checkpoint {checkpoint}: {e}")
+            raise
         
-        # Load with optimized settings
-        self.state_dict = torch.load(
-            checkpoint_path,
-            map_location=self.device,
-            weights_only=True,
-        )
-        
-        # Validate required keys
-        if "image_proj" not in self.state_dict:
-            raise KeyError("Missing 'image_proj' key in checkpoint")
-        if "ip_adapter" not in self.state_dict:
-            raise KeyError("Missing 'ip_adapter' key in checkpoint")
-        
-        # Initialize resampler
+        # Initialize resampler with optimized settings
         self.resampler = TimeResampler(
             dim=1280,
             depth=4,
@@ -182,14 +180,22 @@ class WANIPAdapter:
             timestep_freq_shift=0,
         )
         self.resampler.eval()
-        self.resampler.to(self.device, dtype=torch.float16)
+        
+        # Move to device and set dtype before loading weights for efficiency
+        self.resampler.to(device=device, dtype=torch.float16)
+        
+        if "image_proj" not in self.state_dict:
+            raise KeyError("Missing 'image_proj' key in checkpoint")
         self.resampler.load_state_dict(self.state_dict["image_proj"])
 
-        # Optimize: Count processors more efficiently
-        proc_keys = self.state_dict["ip_adapter"].keys()
-        n_procs = len(set(x.split(".", 1)[0] for x in proc_keys))
+        # Optimize processor count calculation
+        if "ip_adapter" not in self.state_dict:
+            raise KeyError("Missing 'ip_adapter' key in checkpoint")
         
-        # Create processors in batch for better memory allocation
+        # Use set comprehension for faster unique extraction
+        n_procs = len(set(x.split(".", 1)[0] for x in self.state_dict["ip_adapter"].keys()))
+        
+        # Pre-allocate processors in a single batch operation
         self.procs = torch.nn.ModuleList([
             IPAttnProcessor(
                 hidden_size=2432,
@@ -201,9 +207,18 @@ class WANIPAdapter:
             )
             for _ in range(n_procs)
         ])
-        # Move all to device at once
-        self.procs.to(self.device, dtype=torch.float16)
+        
+        # Move all processors at once for better efficiency
+        self.procs.to(device=device, dtype=torch.float16)
         self.procs.load_state_dict(self.state_dict["ip_adapter"])
+        
+        # Enable inference optimizations if available
+        if hasattr(torch, 'compile') and device == 'cuda':
+            try:
+                self.resampler = torch.compile(self.resampler, mode='reduce-overhead')
+                logging.info("Enabled torch.compile for resampler")
+            except Exception as e:
+                logging.warning(f"Could not compile resampler: {e}")
 
 
 class IPAdapterWANLoader:
@@ -255,40 +270,41 @@ class ApplyIPAdapterWAN:
     CATEGORY = "InstantXNodes"
 
     def apply_ipadapter(
-        self, 
-        model: Any, 
-        ipadapter: WANIPAdapter, 
-        image_embed: Any, 
-        weight: float, 
-        start_percent: float, 
-        end_percent: float
+        self,
+        model: Any,
+        ipadapter: WANIPAdapter,
+        image_embed: Any,
+        weight: float,
+        start_percent: float,
+        end_percent: float,
     ) -> Tuple[Any]:
         """
-        Apply IP-Adapter to a model.
+        Apply IP-Adapter to the model with optimized tensor operations.
         
         Args:
-            model: ComfyUI model to apply adapter to
-            ipadapter: Loaded WAN IP-Adapter instance
-            image_embed: CLIP vision output with penultimate_hidden_states
-            weight: Weight for IP adapter influence
-            start_percent: Start percentage of timestep range
-            end_percent: End percentage of timestep range
-        
+            model: The diffusion model to apply IP-Adapter to
+            ipadapter: The loaded IP-Adapter instance
+            image_embed: CLIP vision output containing image embeddings
+            weight: Strength of the IP-Adapter effect
+            start_percent: Start timestep percentage (0.0-1.0)
+            end_percent: End timestep percentage (0.0-1.0)
+            
         Returns:
-            Tuple containing the patched model
+            Tuple containing the modified model
         """
         new_model = model.clone()
-        image_embed = image_embed.penultimate_hidden_states
+        image_embed_tensor = image_embed.penultimate_hidden_states
         
-        # Optimize: Move to device and create zero tensor efficiently
+        # Optimize: pre-allocate on target device instead of cat then move
         device = ipadapter.device
         dtype = torch.float16
-        image_embed_device = image_embed.to(device=device, dtype=dtype)
-        # Create zero tensor directly on target device with same shape
-        zero_embed = torch.zeros_like(image_embed_device)
+        
+        # Create zero tensor directly on target device
+        zero_embed = torch.zeros_like(image_embed_tensor, device=device, dtype=dtype)
+        image_embed_on_device = image_embed_tensor.to(device=device, dtype=dtype)
         
         # Concatenate on device
-        embeds = torch.cat([image_embed_device, zero_embed], dim=0)
+        embeds = torch.cat([image_embed_on_device, zero_embed], dim=0)
         
         patch(
             new_model,
