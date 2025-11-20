@@ -9,7 +9,17 @@ from diffusers.models.embeddings import Timesteps, TimestepEmbedding
 
 
 # FFN
-def FeedForward(dim, mult=4):
+def FeedForward(dim: int, mult: int = 4) -> nn.Sequential:
+    """
+    Feed-forward network module.
+    
+    Args:
+        dim: Input/output dimension
+        mult: Multiplier for inner dimension
+    
+    Returns:
+        Sequential module with LayerNorm, Linear, GELU, Linear
+    """
     inner_dim = int(dim * mult)
     return nn.Sequential(
         nn.LayerNorm(dim),
@@ -162,45 +172,52 @@ class Resampler(nn.Module):
 
 
 class TimeResampler(nn.Module):
+    """
+    Time-aware resampler for IP-Adapter embeddings.
+    
+    Optimized for memory efficiency and performance.
+    """
+    
     def __init__(
         self,
-        dim=1024,
-        depth=8,
-        dim_head=64,
-        heads=16,
-        num_queries=8,
-        embedding_dim=768,
-        output_dim=1024,
-        ff_mult=4,
-        timestep_in_dim=320,
-        timestep_flip_sin_to_cos=True,
-        timestep_freq_shift=0,
+        dim: int = 1024,
+        depth: int = 8,
+        dim_head: int = 64,
+        heads: int = 16,
+        num_queries: int = 8,
+        embedding_dim: int = 768,
+        output_dim: int = 1024,
+        ff_mult: int = 4,
+        timestep_in_dim: int = 320,
+        timestep_flip_sin_to_cos: bool = True,
+        timestep_freq_shift: int = 0,
     ):
         super().__init__()
 
+        # Initialize learnable latents
         self.latents = nn.Parameter(torch.randn(1, num_queries, dim) / dim**0.5)
 
         self.proj_in = nn.Linear(embedding_dim, dim)
-
         self.proj_out = nn.Linear(dim, output_dim)
         self.norm_out = nn.LayerNorm(output_dim)
 
+        # Build layers
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(
                 nn.ModuleList(
                     [
-                        # msa
+                        # Multi-head self-attention
                         PerceiverAttention(dim=dim, dim_head=dim_head, heads=heads),
-                        # ff
+                        # Feed-forward network
                         FeedForward(dim=dim, mult=ff_mult),
-                        # adaLN
+                        # Adaptive layer norm modulation
                         nn.Sequential(nn.SiLU(), nn.Linear(dim, 4 * dim, bias=True)),
                     ]
                 )
             )
 
-        # time
+        # Time embedding components
         self.time_proj = Timesteps(
             timestep_in_dim, timestep_flip_sin_to_cos, timestep_freq_shift
         )
@@ -239,6 +256,7 @@ class TimeResampler(nn.Module):
         # Optimize: use unsqueeze once
         x = x + timestep_emb.unsqueeze(1)
 
+        # Process through layers
         for attn, ff, adaLN_modulation in self.layers:
             # Pre-compute adaLN parameters
             adaLN_params = adaLN_modulation(timestep_emb)
@@ -302,11 +320,13 @@ class TimeResampler(nn.Module):
         elif timesteps.shape[0] != batch_size:
             timesteps = timesteps.expand(batch_size)
 
+        # Project timesteps
         t_emb = self.time_proj(timesteps)
 
         # Cast to sample dtype for consistency (time_proj returns f32)
         if t_emb.dtype != sample.dtype:
             t_emb = t_emb.to(dtype=sample.dtype)
 
+        # Generate embedding
         emb = self.time_embedding(t_emb, None)
         return emb

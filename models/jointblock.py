@@ -173,6 +173,14 @@ class JointBlockIPWrapper:
         adapter: IPAttnProcessor,
         ip_options: Optional[Dict[str, Any]] = None,
     ):
+        """
+        Initialize the wrapper.
+        
+        Args:
+            original_block: The original JointBlock to wrap
+            adapter: IP attention processor
+            ip_options: Dictionary with IP adapter options (hidden_states, t_emb, weight)
+        """
         self.original_block = original_block
         self.adapter = adapter
         self.ip_options = ip_options if ip_options is not None else {}

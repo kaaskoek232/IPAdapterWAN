@@ -74,6 +74,9 @@ def patch(
     timestep_schedule_max = patcher.model.model_config.sampling_settings.get(
         "timesteps", 1000
     )
+    
+    # Use model's string representation as cache key
+    model_id = str(id(model))
 
     # Use a shared dict for ip_options to avoid repeated dict lookups
     ip_options: Dict[str, Optional[torch.Tensor]] = {
