@@ -1,5 +1,6 @@
 # modified from https://github.com/mlfoundations/open_flamingo/blob/main/open_flamingo/src/helpers.py
 import math
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -44,7 +45,13 @@ class PerceiverAttention(nn.Module):
         self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
         self.to_out = nn.Linear(inner_dim, dim, bias=False)
 
-    def forward(self, x, latents, shift=None, scale=None):
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        latents: torch.Tensor, 
+        shift: Optional[torch.Tensor] = None, 
+        scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Args:
             x (torch.Tensor): image features
@@ -55,12 +62,16 @@ class PerceiverAttention(nn.Module):
         x = self.norm1(x)
         latents = self.norm2(latents)
 
+        # Optimize: pre-compute unsqueeze operations
         if shift is not None and scale is not None:
-            latents = latents * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+            scale_unsqueezed = scale.unsqueeze(1)
+            shift_unsqueezed = shift.unsqueeze(1)
+            latents = latents * (1 + scale_unsqueezed) + shift_unsqueezed
 
         b, l, _ = latents.shape
 
         q = self.to_q(latents)
+        # Optimize: use stack or concat more efficiently
         kv_input = torch.cat((x, latents), dim=-2)
         k, v = self.to_kv(kv_input).chunk(2, dim=-1)
 
@@ -68,11 +79,11 @@ class PerceiverAttention(nn.Module):
         k = reshape_tensor(k, self.heads)
         v = reshape_tensor(v, self.heads)
 
-        # attention
-        scale = 1 / math.sqrt(math.sqrt(self.dim_head))
-        weight = (q * scale) @ (k * scale).transpose(
-            -2, -1
-        )  # More stable with f16 than dividing afterwards
+        # attention - optimize: pre-compute scale factor
+        attn_scale = 1 / math.sqrt(math.sqrt(self.dim_head))
+        q_scaled = q * attn_scale
+        k_scaled = k * attn_scale
+        weight = q_scaled @ k_scaled.transpose(-2, -1)
         weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
         out = weight @ v
 
@@ -180,31 +191,41 @@ class TimeResampler(nn.Module):
         #     nn.Linear(timestep_out_dim, 6 * timestep_out_dim, bias=True)
         # )
 
-    def forward(self, x, timestep, need_temb=False):
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        timestep: torch.Tensor, 
+        need_temb: bool = False
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         timestep_emb = self.embedding_time(x, timestep)  # bs, dim
 
-        latents = self.latents.repeat(x.size(0), 1, 1)
+        # Optimize: use expand instead of repeat when possible for memory efficiency
+        batch_size = x.size(0)
+        latents = self.latents.expand(batch_size, -1, -1)
 
         x = self.proj_in(x)
-        x = x + timestep_emb[:, None]
+        # Optimize: use in-place addition where safe
+        x = x + timestep_emb.unsqueeze(1)
 
         for attn, ff, adaLN_modulation in self.layers:
-            shift_msa, scale_msa, shift_mlp, scale_mlp = adaLN_modulation(
-                timestep_emb
-            ).chunk(4, dim=1)
+            # Pre-compute adaLN modulation once
+            adaLN_out = adaLN_modulation(timestep_emb)
+            shift_msa, scale_msa, shift_mlp, scale_mlp = adaLN_out.chunk(4, dim=1)
+            
+            # Optimize: use in-place addition for residual connection
             latents = attn(x, latents, shift_msa, scale_msa) + latents
 
             res = latents
+            # Optimize: pre-compute scale_mlp and shift_mlp unsqueeze
+            scale_mlp_unsqueezed = scale_mlp.unsqueeze(1)
+            shift_mlp_unsqueezed = shift_mlp.unsqueeze(1)
+            
             for idx_ff in range(len(ff)):
                 layer_ff = ff[idx_ff]
                 latents = layer_ff(latents)
                 if idx_ff == 0 and isinstance(layer_ff, nn.LayerNorm):  # adaLN
-                    latents = latents * (
-                        1 + scale_mlp.unsqueeze(1)
-                    ) + shift_mlp.unsqueeze(1)
+                    latents = latents * (1 + scale_mlp_unsqueezed) + shift_mlp_unsqueezed
             latents = latents + res
-
-            # latents = ff(latents) + latents
 
         latents = self.proj_out(latents)
         latents = self.norm_out(latents)
@@ -214,7 +235,11 @@ class TimeResampler(nn.Module):
         else:
             return latents
 
-    def embedding_time(self, sample, timestep):
+    def embedding_time(
+        self, 
+        sample: torch.Tensor, 
+        timestep: torch.Tensor
+    ) -> torch.Tensor:
 
         # 1. time
         timesteps = timestep

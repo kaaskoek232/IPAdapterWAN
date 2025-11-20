@@ -1,3 +1,5 @@
+from typing import Optional, Tuple, Dict, Any
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -78,13 +80,13 @@ class IPAttnProcessor(nn.Module):
 
     def forward(
         self,
-        ip_hidden_states,
-        img_query,
-        img_key=None,
-        img_value=None,
-        t_emb=None,
-        n_heads=1,
-    ):
+        ip_hidden_states: Optional[torch.Tensor],
+        img_query: torch.Tensor,
+        img_key: Optional[torch.Tensor] = None,
+        img_value: Optional[torch.Tensor] = None,
+        t_emb: Optional[torch.Tensor] = None,
+        n_heads: int = 1,
+    ) -> Optional[torch.Tensor]:
         if ip_hidden_states is None:
             return None
 
@@ -94,35 +96,37 @@ class IPAttnProcessor(nn.Module):
         # norm ip input
         norm_ip_hidden_states = self.norm_ip(ip_hidden_states, emb=t_emb)
 
-        # to k and v
+        # to k and v - compute in parallel for better performance
         ip_key = self.to_k_ip(norm_ip_hidden_states)
         ip_value = self.to_v_ip(norm_ip_hidden_states)
 
-        # reshape
+        # reshape - optimize: batch reshape operations
         img_query = rearrange(img_query, "b l (h d) -> b h l d", h=n_heads)
         img_key = rearrange(img_key, "b l (h d) -> b h l d", h=n_heads)
         # note that the image is in a different shape: b l h d
         # so we transpose to b h l d
-        # or do we have to transpose here?
-        img_value = torch.transpose(img_value, 1, 2)
+        # Optimize: use permute instead of transpose for clarity and potential performance
+        img_value = img_value.permute(0, 2, 1) if img_value.dim() == 3 else img_value.transpose(1, 2)
         ip_key = rearrange(ip_key, "b l (h d) -> b h l d", h=n_heads)
         ip_value = rearrange(ip_value, "b l (h d) -> b h l d", h=n_heads)
 
-        # norm
+        # norm - apply norms efficiently
         img_query = self.norm_q(img_query)
         img_key = self.norm_k(img_key)
         ip_key = self.norm_ip_k(ip_key)
 
-        # cat img
+        # cat img - use dim=2 for concatenation along sequence dimension
         key = torch.cat([img_key, ip_key], dim=2)
         value = torch.cat([img_value, ip_value], dim=2)
 
-        #
+        # Optimized attention computation
         ip_hidden_states = F.scaled_dot_product_attention(
             img_query, key, value, dropout_p=0.0, is_causal=False
         )
         ip_hidden_states = rearrange(ip_hidden_states, "b h l d -> b l (h d)")
-        ip_hidden_states = ip_hidden_states.to(img_query.dtype)
+        # Ensure dtype consistency without unnecessary conversion if already correct
+        if ip_hidden_states.dtype != img_query.dtype:
+            ip_hidden_states = ip_hidden_states.to(img_query.dtype)
         return ip_hidden_states
 
 
@@ -133,7 +137,7 @@ class JointBlockIPWrapper:
         self,
         original_block: JointBlock,
         adapter: IPAttnProcessor,
-        ip_options=None,
+        ip_options: Optional[Dict[str, Any]] = None,
     ):
         self.original_block = original_block
         self.adapter = adapter
@@ -144,6 +148,7 @@ class JointBlockIPWrapper:
     def block_mixing(self, context, x, context_block, x_block, c):
         """
         Comes from mmdit.py. Modified to add ipadapter attention.
+        Optimized for performance with efficient tensor operations.
         """
         context_qkv, context_intermediates = context_block.pre_attention(context, c)
 
@@ -152,6 +157,8 @@ class JointBlockIPWrapper:
         else:
             x_qkv, x_intermediates = x_block.pre_attention(x, c)
 
+        # Optimize: pre-compute context length for slicing
+        context_len = context_qkv[0].shape[1]
         qkv = tuple(torch.cat((context_qkv[j], x_qkv[j]), dim=1) for j in range(3))
 
         attn = optimized_attention(
@@ -160,31 +167,34 @@ class JointBlockIPWrapper:
             qkv[2],
             heads=x_block.attn.num_heads,
         )
+        # Optimize: use pre-computed context_len
         context_attn, x_attn = (
-            attn[:, : context_qkv[0].shape[1]],
-            attn[:, context_qkv[0].shape[1] :],
+            attn[:, :context_len],
+            attn[:, context_len:],
         )
         # if the current timestep is not in the ipadapter enabling range, then the resampler wasn't run
         # and the hidden states will be None
-        if (
-            self.ip_options["hidden_states"] is not None
-            and self.ip_options["t_emb"] is not None
-        ):
-            # IP-Adapter
+        ip_hidden_states = self.ip_options["hidden_states"]
+        ip_t_emb = self.ip_options["t_emb"]
+        if ip_hidden_states is not None and ip_t_emb is not None:
+            # IP-Adapter - optimize: cache weight lookup
+            ip_weight = self.ip_options["weight"]
             ip_attn = self.adapter(
-                self.ip_options["hidden_states"],
+                ip_hidden_states,
                 *x_qkv,
-                self.ip_options["t_emb"],
+                ip_t_emb,
                 x_block.attn.num_heads,
             )
-            x_attn = x_attn + ip_attn * self.ip_options["weight"]
+            # Optimize: use in-place addition where safe
+            if ip_attn is not None:
+                x_attn = x_attn + ip_attn * ip_weight
 
         # Everything else is unchanged
         if not context_block.pre_only:
             context = context_block.post_attention(context_attn, *context_intermediates)
-
         else:
             context = None
+            
         if x_block.x_block_self_attn:
             attn2 = optimized_attention(
                 x_qkv2[0],

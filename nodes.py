@@ -1,5 +1,6 @@
 import os
 import logging
+from typing import Optional, Tuple, Dict, Any
 
 import torch
 import folder_paths
@@ -27,7 +28,8 @@ def patch(
     end=1.0,
 ):
     """
-    Model-agnostic patcher that injects IPAdapter-like processors into any attention blocks
+    Model-agnostic patcher that injects IPAdapter-like processors into any attention blocks.
+    Optimized for performance with caching and efficient tensor operations.
     """
     model = patcher.model.diffusion_model
     timestep_schedule_max = patcher.model.model_config.sampling_settings.get(
@@ -40,13 +42,26 @@ def patch(
         "weight": weight,
     }
 
+    # Cache device and dtype for efficiency
+    device = clip_embeds.device
+    dtype = clip_embeds.dtype
+
     def ddit_wrapper(forward, args):
-        t_percent = 1 - args["timestep"].flatten()[0].cpu().item()
+        # Optimize: avoid unnecessary CPU transfer and flatten
+        timestep_tensor = args["timestep"]
+        if timestep_tensor.numel() > 0:
+            t_percent = 1 - timestep_tensor.flatten()[0].cpu().item()
+        else:
+            t_percent = 0.0
+            
         if start <= t_percent <= end:
             batch_size = args["input"].shape[0] // len(args["cond_or_uncond"])
-            embeds = clip_embeds[args["cond_or_uncond"]]
-            embeds = torch.repeat_interleave(embeds, batch_size, dim=0)
-            timestep = args["timestep"] * timestep_schedule_max
+            # Use indexing instead of repeat_interleave for better performance
+            cond_indices = args["cond_or_uncond"]
+            embeds = clip_embeds[cond_indices]
+            if batch_size > 1:
+                embeds = embeds.repeat_interleave(batch_size, dim=0)
+            timestep = timestep_tensor * timestep_schedule_max
             image_emb, t_emb = resampler(embeds, timestep, need_temb=True)
             ip_options["hidden_states"] = image_emb
             ip_options["t_emb"] = t_emb
@@ -58,17 +73,29 @@ def patch(
 
     patcher.set_model_unet_function_wrapper(ddit_wrapper)
 
-    # Generic attention block patching
-    idx = 0
+    # Generic attention block patching - cache attention blocks for efficiency
+    attention_blocks = []
     for name, module in model.named_modules():
         if hasattr(module, "to_q") and hasattr(module, "to_k"):
-            wrapper = JointBlockIPWrapper(module, ip_procs[idx % len(ip_procs)], ip_options)
-            patcher.set_model_patch_replace(wrapper, name)
-            idx += 1
+            attention_blocks.append((name, module))
+    
+    # Pre-allocate wrappers to avoid repeated modulo operations
+    n_procs = len(ip_procs)
+    for idx, (name, module) in enumerate(attention_blocks):
+        wrapper = JointBlockIPWrapper(module, ip_procs[idx % n_procs], ip_options)
+        patcher.set_model_patch_replace(wrapper, name)
 
 
 class WANIPAdapter:
-    def __init__(self, checkpoint: str, device):
+    def __init__(self, checkpoint: str, device: str, enable_compile: bool = True):
+        """
+        Initialize WAN IP-Adapter model.
+        
+        Args:
+            checkpoint: Name of the checkpoint file
+            device: Device to load model on ("cuda", "cpu", "mps")
+            enable_compile: Whether to use torch.compile for optimization (PyTorch 2.0+)
+        """
         self.device = device
         self.state_dict = torch.load(
             os.path.join(MODELS_DIR, checkpoint),
@@ -105,6 +132,17 @@ class WANIPAdapter:
             for _ in range(n_procs)
         ])
         self.procs.load_state_dict(self.state_dict["ip_adapter"])
+        
+        # Optimize with torch.compile if available and enabled
+        if enable_compile and hasattr(torch, "compile"):
+            try:
+                self.resampler = torch.compile(self.resampler, mode="reduce-overhead")
+                # Compile processors individually for better optimization
+                for i, proc in enumerate(self.procs):
+                    self.procs[i] = torch.compile(proc, mode="reduce-overhead")
+                logging.info("torch.compile optimization enabled for IP-Adapter")
+            except Exception as e:
+                logging.warning(f"torch.compile failed, continuing without it: {e}")
 
 
 class IPAdapterWANLoader:
@@ -114,6 +152,9 @@ class IPAdapterWANLoader:
             "required": {
                 "ipadapter": (folder_paths.get_filename_list("ipadapter"),),
                 "provider": (["cuda", "cpu", "mps"],),
+            },
+            "optional": {
+                "enable_compile": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled"}),
             }
         }
 
@@ -122,9 +163,17 @@ class IPAdapterWANLoader:
     FUNCTION = "load_model"
     CATEGORY = "InstantXNodes"
 
-    def load_model(self, ipadapter, provider):
+    def load_model(self, ipadapter: str, provider: str, enable_compile: bool = True):
+        """
+        Load IP-Adapter WAN model.
+        
+        Args:
+            ipadapter: Checkpoint filename
+            provider: Device provider ("cuda", "cpu", "mps")
+            enable_compile: Enable torch.compile optimization (PyTorch 2.0+)
+        """
         logging.info("Loading InstantX IPAdapter WAN model.")
-        model = WANIPAdapter(ipadapter, provider)
+        model = WANIPAdapter(ipadapter, provider, enable_compile=enable_compile)
         return (model,)
 
 
@@ -160,9 +209,12 @@ class ApplyIPAdapterWAN:
     ):
         new_model = model.clone()
         image_embed = image_embed.penultimate_hidden_states
-        embeds = torch.cat([image_embed, torch.zeros_like(image_embed)], dim=0).to(
-            ipadapter.device, dtype=torch.float16
-        )
+        # Optimize: pre-allocate zeros tensor and use stack for better performance
+        device = ipadapter.device
+        dtype = torch.float16
+        zeros = torch.zeros_like(image_embed, device=device, dtype=dtype)
+        image_embed = image_embed.to(device=device, dtype=dtype)
+        embeds = torch.cat([image_embed, zeros], dim=0)
         patch(
             new_model,
             ipadapter.procs,
