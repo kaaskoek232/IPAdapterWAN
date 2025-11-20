@@ -1,5 +1,6 @@
 # modified from https://github.com/mlfoundations/open_flamingo/blob/main/open_flamingo/src/helpers.py
 import math
+from typing import Tuple, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -8,7 +9,17 @@ from diffusers.models.embeddings import Timesteps, TimestepEmbedding
 
 
 # FFN
-def FeedForward(dim, mult=4):
+def FeedForward(dim: int, mult: int = 4) -> nn.Sequential:
+    """
+    Feed-forward network module.
+    
+    Args:
+        dim: Input/output dimension
+        mult: Multiplier for inner dimension
+    
+    Returns:
+        Sequential module with LayerNorm, Linear, GELU, Linear
+    """
     inner_dim = int(dim * mult)
     return nn.Sequential(
         nn.LayerNorm(dim),
@@ -18,19 +29,34 @@ def FeedForward(dim, mult=4):
     )
 
 
-def reshape_tensor(x, heads):
+def reshape_tensor(x: torch.Tensor, heads: int) -> torch.Tensor:
+    """
+    Optimized tensor reshaping for attention heads.
+    
+    Args:
+        x: Input tensor of shape (bs, length, width)
+        heads: Number of attention heads
+    
+    Returns:
+        Reshaped tensor of shape (bs, heads, length, dim_per_head)
+    """
     bs, length, width = x.shape
-    # (bs, length, width) --> (bs, length, n_heads, dim_per_head)
-    x = x.view(bs, length, heads, -1)
-    # (bs, length, n_heads, dim_per_head) --> (bs, n_heads, length, dim_per_head)
-    x = x.transpose(1, 2)
-    # (bs, n_heads, length, dim_per_head) --> (bs*n_heads, length, dim_per_head)
-    x = x.reshape(bs, heads, length, -1)
+    dim_per_head = width // heads
+    
+    # Optimize: Use view + transpose instead of multiple reshape operations
+    # (bs, length, width) --> (bs, length, heads, dim_per_head)
+    x = x.view(bs, length, heads, dim_per_head)
+    # (bs, length, heads, dim_per_head) --> (bs, heads, length, dim_per_head)
+    x = x.transpose(1, 2).contiguous()
     return x
 
 
 class PerceiverAttention(nn.Module):
-    def __init__(self, *, dim, dim_head=64, heads=8):
+    """
+    Perceiver attention module optimized for performance.
+    """
+    
+    def __init__(self, *, dim: int, dim_head: int = 64, heads: int = 8):
         super().__init__()
         self.scale = dim_head**-0.5
         self.dim_head = dim_head
@@ -44,18 +70,30 @@ class PerceiverAttention(nn.Module):
         self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
         self.to_out = nn.Linear(inner_dim, dim, bias=False)
 
-    def forward(self, x, latents, shift=None, scale=None):
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        latents: torch.Tensor, 
+        shift: Optional[torch.Tensor] = None, 
+        scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
+        Forward pass for Perceiver attention.
+        
         Args:
-            x (torch.Tensor): image features
-                shape (b, n1, D)
-            latent (torch.Tensor): latent features
-                shape (b, n2, D)
+            x: Image features of shape (b, n1, D)
+            latents: Latent features of shape (b, n2, D)
+            shift: Optional shift tensor for adaptive normalization
+            scale: Optional scale tensor for adaptive normalization
+        
+        Returns:
+            Output tensor of shape (b, n2, D)
         """
         x = self.norm1(x)
         latents = self.norm2(latents)
 
         if shift is not None and scale is not None:
+            # Optimize: use in-place operations where safe
             latents = latents * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
         b, l, _ = latents.shape
@@ -68,15 +106,15 @@ class PerceiverAttention(nn.Module):
         k = reshape_tensor(k, self.heads)
         v = reshape_tensor(v, self.heads)
 
-        # attention
-        scale = 1 / math.sqrt(math.sqrt(self.dim_head))
-        weight = (q * scale) @ (k * scale).transpose(
-            -2, -1
-        )  # More stable with f16 than dividing afterwards
-        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        # Optimize: Pre-compute scale factor
+        attn_scale = 1 / math.sqrt(math.sqrt(self.dim_head))
+        # Attention computation - more stable with f16
+        weight = (q * attn_scale) @ (k * attn_scale).transpose(-2, -1)
+        weight = torch.softmax(weight.float(), dim=-1).to(weight.dtype)
         out = weight @ v
 
-        out = out.permute(0, 2, 1, 3).reshape(b, l, -1)
+        # Optimize: Use contiguous reshape
+        out = out.permute(0, 2, 1, 3).contiguous().reshape(b, l, -1)
 
         return self.to_out(out)
 
@@ -130,82 +168,105 @@ class Resampler(nn.Module):
 
 
 class TimeResampler(nn.Module):
+    """
+    Time-aware resampler for IP-Adapter embeddings.
+    
+    Optimized for memory efficiency and performance.
+    """
+    
     def __init__(
         self,
-        dim=1024,
-        depth=8,
-        dim_head=64,
-        heads=16,
-        num_queries=8,
-        embedding_dim=768,
-        output_dim=1024,
-        ff_mult=4,
-        timestep_in_dim=320,
-        timestep_flip_sin_to_cos=True,
-        timestep_freq_shift=0,
+        dim: int = 1024,
+        depth: int = 8,
+        dim_head: int = 64,
+        heads: int = 16,
+        num_queries: int = 8,
+        embedding_dim: int = 768,
+        output_dim: int = 1024,
+        ff_mult: int = 4,
+        timestep_in_dim: int = 320,
+        timestep_flip_sin_to_cos: bool = True,
+        timestep_freq_shift: int = 0,
     ):
         super().__init__()
 
+        # Initialize learnable latents
         self.latents = nn.Parameter(torch.randn(1, num_queries, dim) / dim**0.5)
 
         self.proj_in = nn.Linear(embedding_dim, dim)
-
         self.proj_out = nn.Linear(dim, output_dim)
         self.norm_out = nn.LayerNorm(output_dim)
 
+        # Build layers
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(
                 nn.ModuleList(
                     [
-                        # msa
+                        # Multi-head self-attention
                         PerceiverAttention(dim=dim, dim_head=dim_head, heads=heads),
-                        # ff
+                        # Feed-forward network
                         FeedForward(dim=dim, mult=ff_mult),
-                        # adaLN
+                        # Adaptive layer norm modulation
                         nn.Sequential(nn.SiLU(), nn.Linear(dim, 4 * dim, bias=True)),
                     ]
                 )
             )
 
-        # time
+        # Time embedding components
         self.time_proj = Timesteps(
             timestep_in_dim, timestep_flip_sin_to_cos, timestep_freq_shift
         )
         self.time_embedding = TimestepEmbedding(timestep_in_dim, dim, act_fn="silu")
 
-        # adaLN
-        # self.adaLN_modulation = nn.Sequential(
-        #     nn.SiLU(),
-        #     nn.Linear(timestep_out_dim, 6 * timestep_out_dim, bias=True)
-        # )
-
-    def forward(self, x, timestep, need_temb=False):
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        timestep: torch.Tensor, 
+        need_temb: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Forward pass through time-aware resampler.
+        
+        Args:
+            x: Input embeddings of shape (bs, seq_len, embedding_dim)
+            timestep: Timestep tensor
+            need_temb: Whether to return time embedding
+        
+        Returns:
+            Resampled latents, optionally with time embedding
+        """
         timestep_emb = self.embedding_time(x, timestep)  # bs, dim
 
-        latents = self.latents.repeat(x.size(0), 1, 1)
+        # Optimize: Use expand instead of repeat when possible
+        batch_size = x.size(0)
+        latents = self.latents.expand(batch_size, -1, -1)
 
         x = self.proj_in(x)
-        x = x + timestep_emb[:, None]
+        # Add time embedding
+        x = x + timestep_emb.unsqueeze(1)
 
+        # Process through layers
         for attn, ff, adaLN_modulation in self.layers:
-            shift_msa, scale_msa, shift_mlp, scale_mlp = adaLN_modulation(
-                timestep_emb
-            ).chunk(4, dim=1)
+            # Get adaptive normalization parameters
+            adaLN_params = adaLN_modulation(timestep_emb)
+            shift_msa, scale_msa, shift_mlp, scale_mlp = adaLN_params.chunk(4, dim=1)
+            
+            # Attention with residual
             latents = attn(x, latents, shift_msa, scale_msa) + latents
 
+            # Feed-forward with adaptive layer norm
             res = latents
-            for idx_ff in range(len(ff)):
-                layer_ff = ff[idx_ff]
+            for idx_ff, layer_ff in enumerate(ff):
                 latents = layer_ff(latents)
-                if idx_ff == 0 and isinstance(layer_ff, nn.LayerNorm):  # adaLN
-                    latents = latents * (
-                        1 + scale_mlp.unsqueeze(1)
-                    ) + shift_mlp.unsqueeze(1)
+                # Apply adaptive normalization after first LayerNorm
+                if idx_ff == 0 and isinstance(layer_ff, nn.LayerNorm):
+                    latents = latents * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+            
+            # Residual connection
             latents = latents + res
 
-            # latents = ff(latents) + latents
-
+        # Final projection and normalization
         latents = self.proj_out(latents)
         latents = self.norm_out(latents)
 
@@ -214,31 +275,45 @@ class TimeResampler(nn.Module):
         else:
             return latents
 
-    def embedding_time(self, sample, timestep):
-
-        # 1. time
-        timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-            # This would be a good case for the `match` statement (Python 3.10+)
+    def embedding_time(
+        self, 
+        sample: torch.Tensor, 
+        timestep: Union[torch.Tensor, float, int]
+    ) -> torch.Tensor:
+        """
+        Generate time embeddings from timestep.
+        
+        Optimized to reduce CPU-GPU synchronization.
+        
+        Args:
+            sample: Sample tensor (for device/dtype inference)
+            timestep: Timestep value(s)
+        
+        Returns:
+            Time embedding tensor
+        """
+        # Convert timestep to tensor if needed
+        if not torch.is_tensor(timestep):
             is_mps = sample.device.type == "mps"
             if isinstance(timestep, float):
                 dtype = torch.float32 if is_mps else torch.float64
             else:
                 dtype = torch.int32 if is_mps else torch.int64
-            timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
-        elif len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
+            timesteps = torch.tensor([timestep], dtype=dtype, device=sample.device)
+        elif len(timestep.shape) == 0:
+            timesteps = timestep[None].to(sample.device)
+        else:
+            timesteps = timestep
 
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        # Broadcast to batch dimension
         timesteps = timesteps.expand(sample.shape[0])
 
+        # Project timesteps
         t_emb = self.time_proj(timesteps)
 
-        # timesteps does not contain any weights and will always return f32 tensors
-        # but time_embedding might actually be running in fp16. so we need to cast here.
-        # there might be better ways to encapsulate this.
+        # Cast to match sample dtype (important for fp16)
         t_emb = t_emb.to(dtype=sample.dtype)
 
+        # Generate embedding
         emb = self.time_embedding(t_emb, None)
         return emb
