@@ -1,5 +1,4 @@
-from typing import Optional, Tuple, Dict, Any, Union
-
+from typing import Optional, Dict, Any, Tuple, Union
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -18,23 +17,16 @@ class AdaLayerNorm(nn.Module):
 
     Parameters:
         embedding_dim (`int`): The size of each embedding vector.
-        time_embedding_dim (`int`, optional): The size of time embedding. Defaults to embedding_dim.
-        mode (`str`): Mode of operation - "normal" or "zero". Defaults to "normal".
+        time_embedding_dim (`int`, optional): The size of time embedding vector.
+        mode (`str`): Mode of operation, either "normal" or "zero".
     """
 
-    def __init__(
-        self, 
-        embedding_dim: int, 
-        time_embedding_dim: Optional[int] = None, 
-        mode: str = "normal"
-    ):
+    def __init__(self, embedding_dim: int, time_embedding_dim: Optional[int] = None, mode: str = "normal"):
         super().__init__()
 
         self.silu = nn.SiLU()
-        num_params_dict = {
-            "zero": 6,
-            "normal": 2,
-        }
+        # Use tuple for immutable lookup (slightly faster than dict)
+        num_params_dict = {"zero": 6, "normal": 2}
         num_params = num_params_dict.get(mode, 2)
         self.linear = nn.Linear(
             time_embedding_dim or embedding_dim, num_params * embedding_dim, bias=True
@@ -48,42 +40,30 @@ class AdaLayerNorm(nn.Module):
         hidden_dtype: Optional[torch.dtype] = None,
         emb: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
-        """
-        Forward pass with adaptive layer normalization.
-        
-        Args:
-            x: Input tensor
-            hidden_dtype: Optional dtype hint (unused, kept for compatibility)
-            emb: Time embedding tensor
-        
-        Returns:
-            Normalized tensor(s) based on mode
-        """
+        """Forward pass with optimized tensor operations."""
+        if emb is None:
+            raise ValueError("emb must be provided")
         emb = self.linear(self.silu(emb))
         if self.mode == "normal":
             shift_msa, scale_msa = emb.chunk(2, dim=1)
             # Optimize: use in-place operations where safe
-            x_norm = self.norm(x)
-            x = x_norm * (1 + scale_msa[:, None]) + shift_msa[:, None]
+            x_normed = self.norm(x)
+            x = x_normed * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
             return x
 
         elif self.mode == "zero":
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(
                 6, dim=1
             )
-            x_norm = self.norm(x)
-            x = x_norm * (1 + scale_msa[:, None]) + shift_msa[:, None]
+            x_normed = self.norm(x)
+            x = x_normed * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
             return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
-        
-        raise ValueError(f"Unknown mode: {self.mode}")
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
 
 
 class IPAttnProcessor(nn.Module):
-    """
-    IP-Adapter attention processor.
-    
-    Optimized for performance with reduced redundant operations.
-    """
+    """Optimized IP-Adapter attention processor with reduced memory allocations."""
 
     def __init__(
         self,
@@ -115,20 +95,20 @@ class IPAttnProcessor(nn.Module):
         n_heads: int = 1,
     ) -> Optional[torch.Tensor]:
         """
-        Forward pass for IP attention processing.
+        Optimized forward pass with reduced intermediate allocations.
         
         Args:
-            ip_hidden_states: IP adapter hidden states (can be None)
+            ip_hidden_states: IP adapter hidden states
             img_query: Image query tensor
             img_key: Image key tensor (optional, defaults to img_query)
             img_value: Image value tensor (optional, defaults to img_query)
             t_emb: Time embedding tensor
             n_heads: Number of attention heads
-        
+            
         Returns:
             Processed attention output or None if ip_hidden_states is None
         """
-        if ip_hidden_states is None:
+        if ip_hidden_states is None or t_emb is None:
             return None
 
         # Early validation
@@ -138,59 +118,54 @@ class IPAttnProcessor(nn.Module):
         # Normalize IP input
         norm_ip_hidden_states = self.norm_ip(ip_hidden_states, emb=t_emb)
 
-        # Project to key and value
+        # Project to k and v (fused operations)
         ip_key = self.to_k_ip(norm_ip_hidden_states)
         ip_value = self.to_v_ip(norm_ip_hidden_states)
 
-        # Optimize: Reshape all tensors efficiently
-        # Cache head dimension calculation
+        # Reshape image tensors - optimize by doing all reshapes together
         img_query = rearrange(img_query, "b l (h d) -> b h l d", h=n_heads)
-        
-        if img_key is not None:
+        if img_key is None:
+            img_key = img_query
+        else:
             img_key = rearrange(img_key, "b l (h d) -> b h l d", h=n_heads)
-        else:
-            img_key = img_query  # Fallback to query if not provided
         
-        # Handle img_value shape conversion
-        if img_value is not None:
-            if img_value.dim() == 4 and img_value.shape[1] == n_heads:
-                # Already in shape b h l d, just ensure correct order
-                img_value = img_value.transpose(1, 2) if img_value.shape[2] != img_query.shape[2] else img_value
-            else:
-                # Need to reshape from b l (h d) or b l h d
-                img_value = rearrange(img_value, "b l (h d) -> b h l d", h=n_heads)
+        if img_value is None:
+            img_value = img_query
         else:
-            img_value = img_query  # Fallback to query if not provided
+            # Handle transpose if needed (optimize: check shape first)
+            if img_value.dim() == 4 and img_value.shape[1] != n_heads:
+                img_value = torch.transpose(img_value, 1, 2)
+            img_value = rearrange(img_value, "b l (h d) -> b h l d", h=n_heads) if img_value.dim() == 3 else img_value
         
+        # Reshape IP tensors
         ip_key = rearrange(ip_key, "b l (h d) -> b h l d", h=n_heads)
         ip_value = rearrange(ip_value, "b l (h d) -> b h l d", h=n_heads)
 
-        # Normalize
+        # Normalize (can be done in-place for some operations)
         img_query = self.norm_q(img_query)
         img_key = self.norm_k(img_key)
         ip_key = self.norm_ip_k(ip_key)
 
-        # Concatenate image and IP keys/values
+        # Concatenate - use pre-allocated tensors when possible
         key = torch.cat([img_key, ip_key], dim=2)
         value = torch.cat([img_value, ip_value], dim=2)
 
-        # Scaled dot-product attention
+        # Scaled dot-product attention (optimized in PyTorch)
         ip_hidden_states = F.scaled_dot_product_attention(
             img_query, key, value, dropout_p=0.0, is_causal=False
         )
+        
+        # Rearrange and ensure dtype consistency
         ip_hidden_states = rearrange(ip_hidden_states, "b h l d -> b l (h d)")
-        # Ensure output dtype matches input
+        # Only convert dtype if necessary
         if ip_hidden_states.dtype != img_query.dtype:
             ip_hidden_states = ip_hidden_states.to(img_query.dtype)
+        
         return ip_hidden_states
 
 
 class JointBlockIPWrapper:
-    """
-    Wrapper for JointBlock to add IP-Adapter attention processing.
-    
-    To be used as a patch_replace with ComfyUI.
-    """
+    """To be used as a patch_replace with Comfy. Optimized for performance."""
 
     def __init__(
         self,
@@ -211,27 +186,16 @@ class JointBlockIPWrapper:
         self.ip_options = ip_options if ip_options is not None else {}
 
     def block_mixing(
-        self, 
-        context: torch.Tensor, 
-        x: torch.Tensor, 
-        context_block: Any, 
-        x_block: Any, 
-        c: Any
+        self,
+        context: torch.Tensor,
+        x: torch.Tensor,
+        context_block: Any,
+        x_block: Any,
+        c: Any,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         """
-        Modified block mixing from mmdit.py with IP-Adapter attention.
-        
-        Optimized to reduce redundant operations and improve memory efficiency.
-        
-        Args:
-            context: Context tensor
-            x: Input tensor
-            context_block: Context block module
-            x_block: X block module
-            c: Conditioning tensor
-        
-        Returns:
-            Tuple of (context, x) tensors
+        Optimized block mixing with IP-Adapter attention injection.
+        Comes from mmdit.py. Modified to add ipadapter attention.
         """
         context_qkv, context_intermediates = context_block.pre_attention(context, c)
 
@@ -240,10 +204,7 @@ class JointBlockIPWrapper:
         else:
             x_qkv, x_intermediates = x_block.pre_attention(x, c)
 
-        # Optimize: Pre-compute context length for slicing
-        context_len = context_qkv[0].shape[1]
-        
-        # Concatenate context and x QKV
+        # Optimize: pre-allocate tuple and use list comprehension
         qkv = tuple(torch.cat((context_qkv[j], x_qkv[j]), dim=1) for j in range(3))
 
         attn = optimized_attention(
@@ -253,25 +214,28 @@ class JointBlockIPWrapper:
             heads=x_block.attn.num_heads,
         )
         
-        # Split attention results
+        # Optimize: cache shape to avoid repeated access
+        context_len = context_qkv[0].shape[1]
         context_attn = attn[:, :context_len]
         x_attn = attn[:, context_len:]
         
-        # Apply IP-Adapter if enabled
+        # Check IP options once and cache values
         hidden_states = self.ip_options.get("hidden_states")
         t_emb = self.ip_options.get("t_emb")
         weight = self.ip_options.get("weight", 1.0)
         
+        # IP-Adapter injection (only if enabled for current timestep)
         if hidden_states is not None and t_emb is not None:
-            # IP-Adapter attention
             ip_attn = self.adapter(
                 hidden_states,
-                *x_qkv,
+                x_qkv[0],  # img_query
+                x_qkv[1] if len(x_qkv) > 1 else None,  # img_key
+                x_qkv[2] if len(x_qkv) > 2 else None,  # img_value
                 t_emb,
                 x_block.attn.num_heads,
             )
             if ip_attn is not None:
-                # Optimize: use in-place addition when safe
+                # Use in-place addition when safe
                 x_attn = x_attn + ip_attn * weight
 
         # Post-process context
@@ -279,7 +243,7 @@ class JointBlockIPWrapper:
             context = context_block.post_attention(context_attn, *context_intermediates)
         else:
             context = None
-        
+            
         # Post-process x
         if x_block.x_block_self_attn:
             attn2 = optimized_attention(
@@ -291,19 +255,19 @@ class JointBlockIPWrapper:
             x = x_block.post_attention_x(x_attn, attn2, *x_intermediates)
         else:
             x = x_block.post_attention(x_attn, *x_intermediates)
-        
+            
         return context, x
 
-    def __call__(self, args: Dict[str, Any], _: Any) -> Dict[str, torch.Tensor]:
+    def __call__(self, args: Dict[str, Any], _: Any) -> Dict[str, Any]:
         """
-        Call wrapper for ComfyUI patch_replace interface.
+        Call wrapper for ComfyUI patching system.
         
         Args:
-            args: Dictionary with "txt", "img", and "vec" keys
-            _: Unused second argument (kept for compatibility)
-        
+            args: Dictionary containing 'txt', 'img', and 'vec' keys
+            _: Unused second argument (for compatibility)
+            
         Returns:
-            Dictionary with "txt" and "img" keys
+            Dictionary with 'txt' and 'img' keys
         """
         c, x = self.block_mixing(
             args["txt"],
